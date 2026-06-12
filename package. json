@@ -1,7 +1,7 @@
 {
-  "name": "tg-store-bot",
+  "name": "session-otp-bot",
   "version": "1.0.0",
-  "description": "Telegram Store Bot with Admin Panel",
+  "description": "Session OTP Bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
