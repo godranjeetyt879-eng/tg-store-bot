@@ -1,7 +1,7 @@
 {
   "name": "tg-store-bot",
   "version": "1.0.0",
-  "description": "Telegram Store Bot with API",
+  "description": "Telegram Store Bot with Admin Panel",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
