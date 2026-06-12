@@ -6,7 +6,7 @@ const sqlite3 = require('sqlite3').verbose();
 const crypto = require('crypto');
 
 // ============ CONFIGURATION ============
-const BOT_TOKEN = process.env.BOT_TOKEN || '8660333284:AAE6jti_RvaZTSOujSANOmJWxaArSeyhAgA';
+const BOT_TOKEN = process.env.BOT_TOKEN || '8660333284:AAEEU2Tv41kfVBKN2fe8bhNEhict7Sf7ltE';
 const ADMIN_ID = parseInt(process.env.ADMIN_ID || '6106058051');
 const API_PORT = process.env.PORT || 3000;
 
