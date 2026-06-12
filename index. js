@@ -1,0 +1,1316 @@
+// index.js - Complete Telegram Store Bot with Admin Panel & API Management
+// Deploy on Render: Single file solution
+
+const express = require('express');
+const { Telegraf, Markup } = require('telegraf');
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
+const crypto = require('crypto');
+
+// ============ CONFIGURATION ============
+const BOT_TOKEN = process.env.BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
+const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(id => parseInt(id));
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+const API_PORT = process.env.PORT || 3000;
+
+// ============ DATABASE SETUP ============
+const db = new sqlite3.Database('store.db');
+
+db.serialize(() => {
+  // Users table
+  db.run(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    balance INTEGER DEFAULT 0,
+    referred_by INTEGER,
+    referral_code TEXT UNIQUE,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    is_banned BOOLEAN DEFAULT 0
+  )`);
+
+  // Transactions table
+  db.run(`CREATE TABLE IF NOT EXISTS transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    amount INTEGER,
+    type TEXT,
+    description TEXT,
+    status TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  // Products table
+  db.run(`CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT,
+    country TEXT,
+    year INTEGER,
+    phone TEXT,
+    password TEXT,
+    twofa TEXT,
+    price INTEGER,
+    status TEXT DEFAULT 'available',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  // Orders table
+  db.run(`CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    product_id INTEGER,
+    amount INTEGER,
+    status TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  // API Keys table
+  db.run(`CREATE TABLE IF NOT EXISTS api_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER UNIQUE,
+    api_key TEXT UNIQUE,
+    secret TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_regenerated DATETIME
+  )`);
+
+  // Referral earnings table
+  db.run(`CREATE TABLE IF NOT EXISTS referral_earnings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    referrer_id INTEGER,
+    referred_user_id INTEGER,
+    amount INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  // Deposits table
+  db.run(`CREATE TABLE IF NOT EXISTS deposits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    amount INTEGER,
+    screenshot TEXT,
+    status TEXT DEFAULT 'pending',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  // API Logs table
+  db.run(`CREATE TABLE IF NOT EXISTS api_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    endpoint TEXT,
+    ip TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+});
+
+// ============ HELPER FUNCTIONS ============
+function generateReferralCode(userId) {
+  return `REF_${userId}_${Date.now().toString(36)}`;
+}
+
+function generateApiKey() {
+  return 'FRESHTG_' + crypto.randomBytes(16).toString('hex');
+}
+
+function generateApiSecret() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function getOrCreateUser(user, referralCode = null) {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT * FROM users WHERE id = ?', [user.id], async (err, existingUser) => {
+      if (err) return reject(err);
+      
+      if (existingUser) {
+        resolve(existingUser);
+      } else {
+        const refCode = generateReferralCode(user.id);
+        
+        db.run(
+          'INSERT INTO users (id, username, first_name, referral_code, referred_by) VALUES (?, ?, ?, ?, ?)',
+          [user.id, user.username || '', user.first_name || '', refCode, null],
+          async function(err) {
+            if (err) return reject(err);
+            
+            if (referralCode) {
+              db.get('SELECT id FROM users WHERE referral_code = ?', [referralCode], (err, referrer) => {
+                if (err || !referrer) return;
+                db.run('UPDATE users SET referred_by = ? WHERE id = ?', [referrer.id, user.id]);
+              });
+            }
+            
+            db.get('SELECT * FROM users WHERE id = ?', [user.id], (err, newUser) => {
+              if (err) reject(err);
+              else resolve(newUser);
+            });
+          }
+        );
+      }
+    });
+  });
+}
+
+function getUserBalance(userId) {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT balance FROM users WHERE id = ?', [userId], (err, row) => {
+      if (err) reject(err);
+      else resolve(row ? row.balance : 0);
+    });
+  });
+}
+
+function updateBalance(userId, amount, type, description) {
+  return new Promise((resolve, reject) => {
+    db.run('UPDATE users SET balance = balance + ? WHERE id = ?', [amount, userId], function(err) {
+      if (err) return reject(err);
+      
+      db.run(
+        'INSERT INTO transactions (user_id, amount, type, description, status) VALUES (?, ?, ?, ?, ?)',
+        [userId, amount, type, description, 'completed'],
+        (err) => {
+          if (err) reject(err);
+          else resolve(true);
+        }
+      );
+    });
+  });
+}
+
+function getAvailableProduct(type, country = null, year = null) {
+  return new Promise((resolve, reject) => {
+    let query = 'SELECT * FROM products WHERE status = "available" AND type = ?';
+    let params = [type];
+    
+    if (country) {
+      query += ' AND country = ?';
+      params.push(country);
+    }
+    if (year) {
+      query += ' AND year = ?';
+      params.push(year);
+    }
+    
+    query += ' ORDER BY created_at ASC LIMIT 1';
+    
+    db.get(query, params, (err, product) => {
+      if (err) reject(err);
+      else resolve(product);
+    });
+  });
+}
+
+function getStockCount(type, country = null) {
+  return new Promise((resolve, reject) => {
+    let query = 'SELECT COUNT(*) as count FROM products WHERE status = "available" AND type = ?';
+    let params = [type];
+    
+    if (country) {
+      query += ' AND country = ?';
+      params.push(country);
+    }
+    
+    db.get(query, params, (err, row) => {
+      if (err) reject(err);
+      else resolve(row ? row.count : 0);
+    });
+  });
+}
+
+function purchaseProduct(userId, type, country = null, year = null) {
+  return new Promise((resolve, reject) => {
+    db.serialize(() => {
+      db.run('BEGIN TRANSACTION');
+      
+      getAvailableProduct(type, country, year).then(product => {
+        if (!product) {
+          db.run('ROLLBACK');
+          return reject(new Error('No product available'));
+        }
+        
+        db.get('SELECT balance FROM users WHERE id = ?', [userId], (err, user) => {
+          if (err || !user || user.balance < product.price) {
+            db.run('ROLLBACK');
+            return reject(new Error('Insufficient balance'));
+          }
+          
+          db.run('UPDATE products SET status = "sold" WHERE id = ?', [product.id], (err) => {
+            if (err) {
+              db.run('ROLLBACK');
+              return reject(err);
+            }
+            
+            db.run('UPDATE users SET balance = balance - ? WHERE id = ?', [product.price, userId], (err) => {
+              if (err) {
+                db.run('ROLLBACK');
+                return reject(err);
+              }
+              
+              db.run(
+                'INSERT INTO orders (user_id, product_id, amount, status) VALUES (?, ?, ?, ?)',
+                [userId, product.id, product.price, 'completed'],
+                (err) => {
+                  if (err) {
+                    db.run('ROLLBACK');
+                    return reject(err);
+                  }
+                  
+                  db.run(
+                    'INSERT INTO transactions (user_id, amount, type, description, status) VALUES (?, ?, ?, ?, ?)',
+                    [userId, -product.price, 'purchase', `Purchased ${type} account`, 'completed'],
+                    (err) => {
+                      if (err) {
+                        db.run('ROLLBACK');
+                        return reject(err);
+                      }
+                      
+                      db.run('COMMIT');
+                      resolve(product);
+                    }
+                  );
+                }
+              );
+            });
+          });
+        });
+      }).catch(err => {
+        db.run('ROLLBACK');
+        reject(err);
+      });
+    });
+  });
+}
+
+function getReferralStats(userId) {
+  return new Promise((resolve, reject) => {
+    db.get(
+      `SELECT 
+        COUNT(DISTINCT r.referred_user_id) as total_referrals,
+        COALESCE(SUM(r.amount), 0) as total_earnings
+       FROM referral_earnings r 
+       WHERE r.referrer_id = ?`,
+      [userId],
+      (err, row) => {
+        if (err) reject(err);
+        else resolve(row || { total_referrals: 0, total_earnings: 0 });
+      }
+    );
+  });
+}
+
+function getUserStats(userId) {
+  return new Promise((resolve, reject) => {
+    db.get(
+      `SELECT 
+        COUNT(DISTINCT o.id) as total_orders,
+        COALESCE(SUM(o.amount), 0) as total_spent
+       FROM orders o
+       WHERE o.user_id = ? AND o.status = 'completed'`,
+      [userId],
+      (err, row) => {
+        if (err) reject(err);
+        else resolve(row || { total_orders: 0, total_spent: 0 });
+      }
+    );
+  });
+}
+
+function getApiKey(userId) {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT api_key, secret, created_at, last_regenerated FROM api_keys WHERE user_id = ?', [userId], (err, row) => {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
+}
+
+function createApiKey(userId) {
+  return new Promise((resolve, reject) => {
+    const apiKey = generateApiKey();
+    const secret = generateApiSecret();
+    
+    db.run(
+      'INSERT INTO api_keys (user_id, api_key, secret, last_regenerated) VALUES (?, ?, ?, ?)',
+      [userId, apiKey, secret, new Date().toISOString()],
+      function(err) {
+        if (err) reject(err);
+        else resolve({ api_key: apiKey, secret: secret });
+      }
+    );
+  });
+}
+
+function regenerateApiKey(userId) {
+  return new Promise((resolve, reject) => {
+    const apiKey = generateApiKey();
+    const secret = generateApiSecret();
+    
+    db.run(
+      'UPDATE api_keys SET api_key = ?, secret = ?, last_regenerated = ? WHERE user_id = ?',
+      [apiKey, secret, new Date().toISOString(), userId],
+      function(err) {
+        if (err) reject(err);
+        else resolve({ api_key: apiKey, secret: secret });
+      }
+    );
+  });
+}
+
+function logApiRequest(userId, endpoint, ip) {
+  db.run(
+    'INSERT INTO api_logs (user_id, endpoint, ip) VALUES (?, ?, ?)',
+    [userId, endpoint, ip]
+  );
+}
+
+// ============ TELEGRAM BOT SETUP ============
+const bot = new Telegraf(BOT_TOKEN);
+
+// Middleware
+bot.use(async (ctx, next) => {
+  if (ctx.from && !ctx.from.is_bot) {
+    const referralCode = ctx.startPayload || null;
+    await getOrCreateUser(ctx.from, referralCode);
+  }
+  await next();
+});
+
+// ============ BOT COMMANDS ============
+
+// Start command
+bot.start(async (ctx) => {
+  const user = await getOrCreateUser(ctx.from);
+  const balance = await getUserBalance(ctx.from.id);
+  
+  const welcomeMessage = `
+🎉 *Welcome to Fresh TG Store!* 🎉
+
+Hi ${ctx.from.first_name}! 
+
+💰 *Your Balance:* ₹${balance}
+
+📌 *Features:*
+• Buy premium Telegram accounts
+• Earn 3% referral commission
+• 24/7 automated delivery
+• API access for developers
+
+Use the buttons below to get started!
+  `;
+  
+  await ctx.reply(welcomeMessage, {
+    parse_mode: 'Markdown',
+    ...Markup.keyboard([
+      ['🛒 Buy Account', '📦 My Orders'],
+      ['👤 My Profile', '🤝 Refer & Earn'],
+      ['💰 Deposit', '📊 My Stats'],
+      ['🔑 API', '❓ Support']
+    ]).resize()
+  });
+});
+
+// Buy Account
+bot.hears('🛒 Buy Account', async (ctx) => {
+  await ctx.reply('Select account type:', Markup.inlineKeyboard([
+    [Markup.button.callback('📱 Telegram Account', 'buy_account')],
+    [Markup.button.callback('💬 Telegram Session', 'buy_session')]
+  ]));
+});
+
+bot.action('buy_account', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply('Select country:', Markup.inlineKeyboard([
+    [Markup.button.callback('🇮🇳 India - ₹50', 'buy_account_India')],
+    [Markup.button.callback('🇺🇸 USA - ₹80', 'buy_account_USA')],
+    [Markup.button.callback('🇬🇧 UK - ₹75', 'buy_account_UK')],
+    [Markup.button.callback('🔙 Back', 'back_main')]
+  ]));
+});
+
+bot.action(/buy_account_(.+)/, async (ctx) => {
+  const country = ctx.match[1];
+  await ctx.answerCbQuery();
+  
+  const stock = await getStockCount('account', country);
+  if (stock === 0) {
+    return ctx.reply('❌ Sorry, no accounts available for this country right now!');
+  }
+  
+  const price = country === 'India' ? 50 : country === 'USA' ? 80 : 75;
+  await ctx.reply(`${country === 'India' ? '🇮🇳' : country === 'USA' ? '🇺🇸' : '🇬🇧'} *${country} Account*\n💰 Price: ₹${price}\n📦 Stock: ${stock}\n\nConfirm purchase?`, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Confirm Purchase', `confirm_account_${country}`)],
+      [Markup.button.callback('🔙 Back', 'buy_account')]
+    ])
+  });
+});
+
+bot.action(/confirm_account_(.+)/, async (ctx) => {
+  const country = ctx.match[1];
+  const price = country === 'India' ? 50 : country === 'USA' ? 80 : 75;
+  const userId = ctx.from.id;
+  
+  const balance = await getUserBalance(userId);
+  if (balance < price) {
+    return ctx.reply(`❌ Insufficient balance!\n\n💰 Your Balance: ₹${balance}\n💸 Required: ₹${price}\n\nPlease deposit funds first.`);
+  }
+  
+  try {
+    const product = await purchaseProduct(userId, 'account', country);
+    await ctx.reply(`✅ *Purchase Successful!*\n\n📱 Phone: \`${product.phone}\`\n🔑 Password: \`${product.password || 'No password'}\`\n🌍 Country: ${product.country}\n📅 Year: ${product.year}\n\n⚠️ Keep this information safe!`, {
+      parse_mode: 'Markdown'
+    });
+  } catch (error) {
+    await ctx.reply(`❌ Purchase failed: ${error.message}`);
+  }
+});
+
+bot.action('buy_session', async (ctx) => {
+  await ctx.answerCbQuery();
+  const stock = await getStockCount('session');
+  await ctx.reply(`💬 *Telegram Session*\n💰 Price: ₹120\n📦 Stock: ${stock}\n\nSessions are delivered as JSON files.`, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Buy Session', 'confirm_session')],
+      [Markup.button.callback('🔙 Back', 'buy_account')]
+    ])
+  });
+});
+
+bot.action('confirm_session', async (ctx) => {
+  const userId = ctx.from.id;
+  const price = 120;
+  
+  const balance = await getUserBalance(userId);
+  if (balance < price) {
+    return ctx.reply(`❌ Insufficient balance!\n\n💰 Your Balance: ₹${balance}\n💸 Required: ₹${price}`);
+  }
+  
+  try {
+    const product = await purchaseProduct(userId, 'session');
+    await ctx.reply(`✅ *Session Purchased!*\n\n📱 Phone: \`${product.phone}\`\n🔑 Session Data: \`${product.password}\`\n\nUse this session string to login.`, {
+      parse_mode: 'Markdown'
+    });
+  } catch (error) {
+    await ctx.reply(`❌ Purchase failed: ${error.message}`);
+  }
+});
+
+// My Profile
+bot.hears('👤 My Profile', async (ctx) => {
+  const user = await getOrCreateUser(ctx.from);
+  const balance = await getUserBalance(ctx.from.id);
+  const stats = await getUserStats(ctx.from.id);
+  
+  await ctx.reply(`
+👤 *Your Profile*
+
+🆔 ID: \`${user.id}\`
+👤 Name: ${user.first_name}
+💰 Balance: ₹${balance}
+📦 Total Orders: ${stats.total_orders}
+💸 Total Spent: ₹${stats.total_spent}
+🔗 Referral Code: \`${user.referral_code}\`
+
+*Referral Link:*
+https://t.me/${ctx.bot.botInfo.username}?start=${user.referral_code}
+  `, {
+    parse_mode: 'Markdown'
+  });
+});
+
+// Refer & Earn
+bot.hears('🤝 Refer & Earn', async (ctx) => {
+  const user = await getOrCreateUser(ctx.from);
+  const refStats = await getReferralStats(ctx.from.id);
+  
+  await ctx.reply(`
+🎁 *Referral Program*
+
+Earn *3%* of every deposit made by your referrals!
+
+📊 *Your Stats:*
+• Total Referrals: ${refStats.total_referrals}
+• Total Earnings: ₹${refStats.total_earnings}
+
+🔗 *Your Referral Link:*
+\`https://t.me/${ctx.bot.botInfo.username}?start=${user.referral_code}\`
+
+Share this link with friends to earn!
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.url('📤 Share Link', `https://t.me/share/url?url=https://t.me/${ctx.bot.botInfo.username}?start=${user.referral_code}&text=Join this awesome Telegram store!`)]
+    ])
+  });
+});
+
+// Deposit
+bot.hears('💰 Deposit', async (ctx) => {
+  await ctx.reply(`
+💰 *Add Funds to Wallet*
+
+Send payment to the following UPI ID:
+
+🏦 *UPI ID:* \`freshtg@okhdfcbank\`
+💰 *Amount:* Minimum ₹100
+
+After sending payment, click below to submit screenshot for verification.
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('📸 Submit Payment Proof', 'submit_deposit')]
+    ])
+  });
+});
+
+let depositState = {};
+bot.action('submit_deposit', async (ctx) => {
+  await ctx.answerCbQuery();
+  depositState[ctx.from.id] = { waiting: true };
+  await ctx.reply('Please send a screenshot of the payment receipt.');
+});
+
+bot.on('photo', async (ctx) => {
+  if (depositState[ctx.from.id]?.waiting) {
+    const photo = ctx.message.photo[ctx.message.photo.length - 1];
+    const fileId = photo.file_id;
+    
+    db.run(
+      'INSERT INTO deposits (user_id, amount, screenshot, status) VALUES (?, ?, ?, ?)',
+      [ctx.from.id, 0, fileId, 'pending'],
+      function(err) {
+        if (err) {
+          ctx.reply('❌ Error submitting deposit. Please try again.');
+        } else {
+          delete depositState[ctx.from.id];
+          ctx.reply('✅ Deposit request submitted! Admin will verify and add funds to your wallet.');
+          
+          ADMIN_IDS.forEach(adminId => {
+            ctx.telegram.sendMessage(adminId, 
+              `💰 *New Deposit Request*\n\nUser: ${ctx.from.first_name} (ID: ${ctx.from.id})\n\nUse /approve_deposit ${ctx.from.id} <amount> to approve.`,
+              { parse_mode: 'Markdown' }
+            );
+          });
+        }
+      }
+    );
+  }
+});
+
+// My Orders
+bot.hears('📦 My Orders', async (ctx) => {
+  db.all('SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 10', [ctx.from.id], (err, orders) => {
+    if (err || !orders.length) {
+      return ctx.reply('📦 No orders found.');
+    }
+    
+    let message = '📦 *Your Recent Orders*\n\n';
+    orders.forEach(order => {
+      message += `🆔 Order #${order.id}\n💰 Amount: ₹${order.amount}\n📅 ${order.created_at}\n\n`;
+    });
+    
+    ctx.reply(message, { parse_mode: 'Markdown' });
+  });
+});
+
+// My Stats
+bot.hears('📊 My Stats', async (ctx) => {
+  const stats = await getUserStats(ctx.from.id);
+  await ctx.reply(`📊 *Your Statistics*\n\n📦 Total Orders: ${stats.total_orders}\n💸 Total Spent: ₹${stats.total_spent}\n\nKeep shopping!`, {
+    parse_mode: 'Markdown'
+  });
+});
+
+// ============ API KEY MANAGEMENT (Like your reference image) ============
+bot.hears('🔑 API', async (ctx) => {
+  let apiKeyData = await getApiKey(ctx.from.id);
+  
+  if (!apiKeyData) {
+    // No API key exists, create one
+    apiKeyData = await createApiKey(ctx.from.id);
+    await ctx.reply(`
+🔑 *API Key Generated!*
+
+- **API Key:**  
+  \`${apiKeyData.api_key}\`
+
+- **API Secret:**  
+  \`${apiKeyData.secret}\`
+
+---
+
+⚠️ **IMPORTANT:**  
+- Your API secret is shown only once  
+- Save this information immediately  
+- Keep your secret safe!
+
+---
+
+📚 *View API Documentation*
+/apidocs
+
+🔗 *Base URL:*  
+\`http://vega.ender.co.in:${API_PORT}/api/v1\`
+    `, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('📚 View API Docs', 'view_api_docs')],
+        [Markup.button.callback('🔄 Regenerate API Key', 'regenerate_api')]
+      ])
+    });
+  } else {
+    // Show existing API key (without secret)
+    await ctx.reply(`
+🔑 *Your API Credentials*
+
+- **API Key:**  
+  \`${apiKeyData.api_key}\`
+
+- **Secret:** Hidden for security
+
+---
+
+⚠️ Your API secret was shown only once when created.
+
+📚 *View API Documentation*
+/apidocs
+
+🔄 Use /regenerate to create a new API key
+    `, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('📚 View API Docs', 'view_api_docs')],
+        [Markup.button.callback('🔄 Regenerate API Key', 'regenerate_api')]
+      ])
+    });
+  }
+});
+
+// Regenerate command
+bot.command('regenerate', async (ctx) => {
+  const userId = ctx.from.id;
+  
+  try {
+    const newKeys = await regenerateApiKey(userId);
+    await ctx.reply(`
+🔄 *API Key Regenerated!*
+
+- **New API Key:**  
+  \`${newKeys.api_key}\`
+
+- **New API Secret:**  
+  \`${newKeys.secret}\`
+
+---
+
+⚠️ **IMPORTANT:**  
+- Your old API key is now invalid  
+- Update your integrations with this new key  
+- Save this secret immediately!
+
+---
+
+📚 *API Documentation*
+/apidocs
+    `, {
+      parse_mode: 'Markdown'
+    });
+  } catch (error) {
+    await ctx.reply('❌ Error regenerating API key. Please try again.');
+  }
+});
+
+bot.action('regenerate_api', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from.id;
+  
+  try {
+    const newKeys = await regenerateApiKey(userId);
+    await ctx.reply(`
+🔄 *API Key Regenerated!*
+
+- **New API Key:**  
+  \`${newKeys.api_key}\`
+
+- **New API Secret:**  
+  \`${newKeys.secret}\`
+
+---
+
+⚠️ **IMPORTANT:**  
+- Your old API key is now invalid  
+- Update your integrations with this new key  
+- Save this secret immediately!
+
+---
+
+📚 *API Documentation*
+/apidocs
+    `, {
+      parse_mode: 'Markdown'
+    });
+  } catch (error) {
+    await ctx.reply('❌ Error regenerating API key. Please try again.');
+  }
+});
+
+// API Documentation
+bot.command('apidocs', async (ctx) => {
+  await ctx.reply(`
+📚 *Fresh TG API Documentation*
+
+━━━━━━━━━━━━━━━━━━━━
+*Base URL*
+\`http://vega.ender.co.in:${API_PORT}/api/v1\`
+
+━━━━━━━━━━━━━━━━━━━━
+*Endpoints*
+
+1️⃣ *GET / POST /get_balance*
+Get your wallet balance
+
+\`\`\`json
+{
+  "api_key": "YOUR_API_KEY"
+}
+\`\`\`
+
+2️⃣ *GET / POST /get_stock*
+Check available stock
+
+\`\`\`json
+{
+  "api_key": "YOUR_API_KEY",
+  "country": "India"
+}
+\`\`\`
+
+3️⃣ *POST /buy_account*
+Purchase an account
+
+\`\`\`json
+{
+  "api_key": "YOUR_API_KEY",
+  "country": "India",
+  "year": 2024
+}
+\`\`\`
+
+4️⃣ *GET / POST /get_otp*
+Get OTP for account
+
+\`\`\`json
+{
+  "api_key": "YOUR_API_KEY",
+  "phone": "919876543210"
+}
+\`\`\`
+
+━━━━━━━━━━━━━━━━━━━━
+*Rate Limits*
+• 60 requests per minute
+• 1000 requests per day
+
+━━━━━━━━━━━━━━━━━━━━
+*Error Codes*
+• 401 - Invalid API key
+• 400 - Insufficient balance
+• 429 - Rate limit exceeded
+• 404 - No stock available
+
+━━━━━━━━━━━━━━━━━━━━
+*Support*
+Contact: @nibbidealer
+  `, {
+    parse_mode: 'Markdown'
+  });
+});
+
+bot.action('view_api_docs', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply(`
+📚 *API Documentation*
+
+*Base URL:*  
+\`http://vega.ender.co.in:${API_PORT}/api/v1\`
+
+*Endpoints:*
+• \`/get_balance\` - Check balance
+• \`/get_stock\` - Check stock
+• \`/buy_account\` - Purchase account
+• \`/get_otp\` - Get OTP
+
+*Rate Limits:* 60 req/min
+
+Use /apidocs for full documentation
+  `, { parse_mode: 'Markdown' });
+});
+
+// Support
+bot.hears('❓ Support', async (ctx) => {
+  await ctx.reply(`
+❓ *Need Help?*
+
+📌 *Common Issues:*
+• Account not working? Contact support within 24 hours
+• Deposit not credited? Wait for admin approval
+• Wrong product received? Submit a ticket
+
+👨‍💻 *Contact Support:*
+@nibbidealer
+
+⚡ *Response Time:* Usually within 6-12 hours
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.url('📞 Contact Support', 'https://t.me/nibbidealer')]
+    ])
+  });
+});
+
+bot.action('back_main', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply('🏠 *Main Menu*', { parse_mode: 'Markdown' });
+});
+
+// ============ ADMIN COMMANDS ============
+bot.command('admin', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id)) {
+    return ctx.reply('❌ Unauthorized!');
+  }
+  
+  await ctx.reply(`
+👑 *Admin Panel*
+
+Select an option:
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('📦 Add Product', 'admin_add_product')],
+      [Markup.button.callback('📊 View Stats', 'admin_stats')],
+      [Markup.button.callback('💰 Pending Deposits', 'admin_deposits')],
+      [Markup.button.callback('👥 Users List', 'admin_users')],
+      [Markup.button.callback('➕ Add Balance', 'admin_add_balance')],
+      [Markup.button.callback('📈 Referral Stats', 'admin_ref_stats')],
+      [Markup.button.callback('🔑 API Logs', 'admin_api_logs')]
+    ])
+  });
+});
+
+let adminState = {};
+
+bot.action('admin_add_product', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
+  await ctx.answerCbQuery();
+  
+  adminState[ctx.from.id] = { step: 'type' };
+  await ctx.reply(`
+📦 *Add New Product*
+
+Step 1: Select product type
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('📱 Account', 'product_type_account')],
+      [Markup.button.callback('💬 Session', 'product_type_session')],
+      [Markup.button.callback('❌ Cancel', 'cancel_admin')]
+    ])
+  });
+});
+
+bot.action('product_type_account', async (ctx) => {
+  adminState[ctx.from.id] = { step: 'country', type: 'account' };
+  await ctx.reply('Step 2: Enter country (e.g., India, USA, UK):');
+});
+
+bot.action('product_type_session', async (ctx) => {
+  adminState[ctx.from.id] = { step: 'phone', type: 'session' };
+  await ctx.reply('Step 2: Enter phone number with country code:');
+});
+
+bot.on('text', async (ctx) => {
+  const state = adminState[ctx.from.id];
+  if (!state) return;
+  
+  if (state.step === 'country') {
+    state.country = ctx.message.text;
+    state.step = 'year';
+    await ctx.reply('Step 3: Enter year (e.g., 2024):');
+  } 
+  else if (state.step === 'year') {
+    state.year = parseInt(ctx.message.text);
+    state.step = 'phone';
+    await ctx.reply('Step 4: Enter phone number:');
+  }
+  else if (state.step === 'phone') {
+    state.phone = ctx.message.text;
+    state.step = 'password';
+    await ctx.reply('Step 5: Enter password (or "none"):');
+  }
+  else if (state.step === 'password') {
+    state.password = ctx.message.text === 'none' ? null : ctx.message.text;
+    state.step = 'twofa';
+    await ctx.reply('Step 6: Enter 2FA code (or "none"):');
+  }
+  else if (state.step === 'twofa') {
+    state.twofa = ctx.message.text === 'none' ? null : ctx.message.text;
+    state.step = 'price';
+    await ctx.reply('Step 7: Enter price in INR:');
+  }
+  else if (state.step === 'price') {
+    state.price = parseInt(ctx.message.text);
+    
+    db.run(
+      `INSERT INTO products (type, country, year, phone, password, twofa, price) 
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [state.type, state.country, state.year, state.phone, state.password, state.twofa, state.price],
+      function(err) {
+        if (err) {
+          ctx.reply('❌ Error adding product!');
+        } else {
+          ctx.reply(`✅ Product added successfully!\n\nID: ${this.lastID}\nType: ${state.type}\nPrice: ₹${state.price}`);
+        }
+        delete adminState[ctx.from.id];
+      }
+    );
+  }
+  else if (state.step === 'add_balance_user') {
+    const userId = parseInt(ctx.message.text);
+    state.userId = userId;
+    state.step = 'add_balance_amount';
+    await ctx.reply(`User ID: ${userId}\nEnter amount to add (in INR):`);
+  }
+  else if (state.step === 'add_balance_amount') {
+    const amount = parseInt(ctx.message.text);
+    await updateBalance(state.userId, amount, 'admin_add', `Admin added ₹${amount}`);
+    await ctx.reply(`✅ Added ₹${amount} to user ${state.userId}`);
+    delete adminState[ctx.from.id];
+  }
+});
+
+bot.action('admin_add_balance', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
+  await ctx.answerCbQuery();
+  adminState[ctx.from.id] = { step: 'add_balance_user' };
+  await ctx.reply('Enter the user ID to add balance:');
+});
+
+bot.action('admin_stats', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
+  await ctx.answerCbQuery();
+  
+  db.get('SELECT COUNT(*) as total_users FROM users', [], (err, users) => {
+    db.get('SELECT COUNT(*) as total_orders FROM orders', [], (err, orders) => {
+      db.get('SELECT COALESCE(SUM(amount), 0) as total_revenue FROM orders', [], (err, revenue) => {
+        db.get('SELECT COUNT(*) as available_products FROM products WHERE status = "available"', [], (err, products) => {
+          ctx.reply(`
+📊 *Store Statistics*
+
+👥 Total Users: ${users.total_users}
+📦 Total Orders: ${orders.total_orders}
+💰 Total Revenue: ₹${revenue.total_revenue}
+📦 Available Products: ${products.available_products}
+          `, { parse_mode: 'Markdown' });
+        });
+      });
+    });
+  });
+});
+
+bot.action('admin_deposits', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
+  await ctx.answerCbQuery();
+  
+  db.all('SELECT * FROM deposits WHERE status = "pending" ORDER BY created_at DESC', [], (err, deposits) => {
+    if (err || !deposits.length) {
+      return ctx.reply('No pending deposits.');
+    }
+    
+    deposits.forEach(deposit => {
+      ctx.reply(`💰 *Pending Deposit*\n\nUser ID: ${deposit.user_id}\nStatus: ${deposit.status}\n\nUse:\n/approve_deposit ${deposit.user_id} <amount>\n/reject_deposit ${deposit.user_id}`, {
+        parse_mode: 'Markdown'
+      });
+    });
+  });
+});
+
+bot.command('approve_deposit', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id)) return;
+  
+  const args = ctx.message.text.split(' ');
+  if (args.length < 3) {
+    return ctx.reply('Usage: /approve_deposit <user_id> <amount>');
+  }
+  
+  const userId = parseInt(args[1]);
+  const amount = parseInt(args[2]);
+  
+  await updateBalance(userId, amount, 'deposit', `Deposit of ₹${amount}`);
+  db.run('UPDATE deposits SET status = "approved", amount = ? WHERE user_id = ? AND status = "pending"', [amount, userId]);
+  
+  await ctx.reply(`✅ Approved ₹${amount} deposit for user ${userId}`);
+  await ctx.telegram.sendMessage(userId, `✅ Your deposit of ₹${amount} has been approved and added to your wallet!`);
+});
+
+bot.command('reject_deposit', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id)) return;
+  
+  const args = ctx.message.text.split(' ');
+  if (args.length < 2) {
+    return ctx.reply('Usage: /reject_deposit <user_id>');
+  }
+  
+  const userId = parseInt(args[1]);
+  db.run('UPDATE deposits SET status = "rejected" WHERE user_id = ? AND status = "pending"', [userId]);
+  await ctx.reply(`❌ Rejected deposit for user ${userId}`);
+  await ctx.telegram.sendMessage(userId, `❌ Your deposit request was rejected. Please contact support.`);
+});
+
+bot.action('admin_users', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
+  await ctx.answerCbQuery();
+  
+  db.all('SELECT id, username, first_name, balance, created_at FROM users ORDER BY created_at DESC LIMIT 20', [], (err, users) => {
+    if (err) return ctx.reply('Error fetching users');
+    
+    let message = '👥 *Recent Users*\n\n';
+    users.forEach(user => {
+      message += `🆔 ${user.id} | ${user.first_name}\n💰 ₹${user.balance}\n📅 ${user.created_at}\n\n`;
+    });
+    
+    ctx.reply(message, { parse_mode: 'Markdown' });
+  });
+});
+
+bot.action('admin_ref_stats', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
+  await ctx.answerCbQuery();
+  
+  db.all(`
+    SELECT u.id, u.first_name, COUNT(r.id) as referrals, COALESCE(SUM(r.amount), 0) as earnings
+    FROM users u
+    LEFT JOIN referral_earnings r ON u.id = r.referrer_id
+    GROUP BY u.id
+    ORDER BY referrals DESC
+    LIMIT 10
+  `, [], (err, users) => {
+    let message = '🏆 *Top Referrers*\n\n';
+    users.forEach((user, idx) => {
+      if (user.referrals > 0) {
+        message += `${idx + 1}. ${user.first_name}\n👥 ${user.referrals} referrals | ₹${user.earnings}\n\n`;
+      }
+    });
+    ctx.reply(message, { parse_mode: 'Markdown' });
+  });
+});
+
+bot.action('admin_api_logs', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
+  await ctx.answerCbQuery();
+  
+  db.all('SELECT * FROM api_logs ORDER BY created_at DESC LIMIT 20', [], (err, logs) => {
+    if (err || !logs.length) {
+      return ctx.reply('No API logs found.');
+    }
+    
+    let message = '🔑 *Recent API Requests*\n\n';
+    logs.forEach(log => {
+      message += `👤 User: ${log.user_id}\n🔗 ${log.endpoint}\n📅 ${log.created_at}\n\n`;
+    });
+    ctx.reply(message, { parse_mode: 'Markdown' });
+  });
+});
+
+bot.action('cancel_admin', async (ctx) => {
+  delete adminState[ctx.from.id];
+  await ctx.reply('❌ Operation cancelled.');
+});
+
+// ============ EXPRESS API SERVER ============
+const app = express();
+app.use(express.json());
+
+// Rate limiting
+const rateLimit = new Map();
+
+function checkRateLimit(apiKey) {
+  const now = Date.now();
+  const windowMs = 60 * 1000; // 1 minute
+  const maxRequests = 60;
+  
+  if (!rateLimit.has(apiKey)) {
+    rateLimit.set(apiKey, []);
+  }
+  
+  const requests = rateLimit.get(apiKey).filter(time => now - time < windowMs);
+  
+  if (requests.length >= maxRequests) {
+    return false;
+  }
+  
+  requests.push(now);
+  rateLimit.set(apiKey, requests);
+  return true;
+}
+
+// API Authentication middleware
+function authenticateApiKey(req, res, next) {
+  const { api_key } = req.body;
+  
+  if (!api_key) {
+    return res.status(401).json({ success: false, error: 'API key required' });
+  }
+  
+  if (!checkRateLimit(api_key)) {
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded. Max 60 requests per minute.' });
+  }
+  
+  db.get('SELECT user_id FROM api_keys WHERE api_key = ?', [api_key], (err, key) => {
+    if (err || !key) {
+      return res.status(401).json({ success: false, error: 'Invalid API key' });
+    }
+    req.userId = key.user_id;
+    logApiRequest(req.userId, req.path, req.ip);
+    next();
+  });
+}
+
+// API Endpoints
+app.post('/api/v1/get_balance', authenticateApiKey, async (req, res) => {
+  const balance = await getUserBalance(req.userId);
+  res.json({
+    success: true,
+    balance: balance,
+    balance_usdt: (balance / 94).toFixed(2),
+    currency: 'INR'
+  });
+});
+
+app.get('/api/v1/get_balance', authenticateApiKey, async (req, res) => {
+  const balance = await getUserBalance(req.userId);
+  res.json({
+    success: true,
+    balance: balance,
+    balance_usdt: (balance / 94).toFixed(2),
+    currency: 'INR'
+  });
+});
+
+app.post('/api/v1/get_stock', authenticateApiKey, async (req, res) => {
+  const { country } = req.body;
+  const count = await getStockCount('account', country);
+  res.json({
+    success: true,
+    stock: count,
+    country: country || 'all'
+  });
+});
+
+app.get('/api/v1/get_stock', authenticateApiKey, async (req, res) => {
+  const { country } = req.query;
+  const count = await getStockCount('account', country);
+  res.json({
+    success: true,
+    stock: count,
+    country: country || 'all'
+  });
+});
+
+app.post('/api/v1/buy_account', authenticateApiKey, async (req, res) => {
+  const { country, year } = req.body;
+  
+  if (!country) {
+    return res.status(400).json({ success: false, error: 'Country parameter required' });
+  }
+  
+  try {
+    const product = await purchaseProduct(req.userId, 'account', country, year);
+    res.json({
+      success: true,
+      order_id: product.id,
+      account: {
+        phone: product.phone,
+        country: product.country,
+        flag: getFlagEmoji(product.country),
+        year: product.year,
+        price_paid: product.price,
+        twofa: product.twofa || 'No 2FA'
+      }
+    });
+  } catch (error) {
+    res.status(400).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/v1/get_otp', authenticateApiKey, async (req, res) => {
+  const { phone } = req.body;
+  
+  if (!phone) {
+    return res.status(400).json({ success: false, error: 'Phone parameter required' });
+  }
+  
+  // In production, integrate with actual OTP service
+  res.json({
+    success: true,
+    phone: phone,
+    otp: Math.floor(100000 + Math.random() * 900000).toString(),
+    twofa: 'No 2FA'
+  });
+});
+
+app.get('/api/v1/get_otp', authenticateApiKey, async (req, res) => {
+  const { phone } = req.query;
+  
+  if (!phone) {
+    return res.status(400).json({ success: false, error: 'Phone parameter required' });
+  }
+  
+  res.json({
+    success: true,
+    phone: phone,
+    otp: Math.floor(100000 + Math.random() * 900000).toString(),
+    twofa: 'No 2FA'
+  });
+});
+
+function getFlagEmoji(country) {
+  const flags = {
+    'India': '🇮🇳',
+    'USA': '🇺🇸',
+    'UK': '🇬🇧',
+    'Canada': '🇨🇦',
+    'Australia': '🇦🇺'
+  };
+  return flags[country] || '🌍';
+}
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// ============ START SERVER & BOT ============
+app.listen(API_PORT, () => {
+  console.log(`✅ API Server running on port ${API_PORT}`);
+  console.log(`📡 API Base URL: http://localhost:${API_PORT}/api/v1`);
+});
+
+bot.launch().then(() => {
+  console.log('🤖 Bot is running...');
+}).catch(err => {
+  console.error('Bot launch error:', err);
+});
+
+// Enable graceful stop
+process.once('SIGINT', () => {
+  bot.stop('SIGINT');
+  process.exit(0);
+});
+process.once('SIGTERM', () => {
+  bot.stop('SIGTERM');
+  process.exit(0);
+});
+
+console.log('✅ Fresh TG Store Bot Started!');
