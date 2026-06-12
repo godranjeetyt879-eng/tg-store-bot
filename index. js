@@ -1,4 +1,4 @@
-// index.js - Complete Telegram Store Bot with Advanced Admin Dashboard
+// index.js - Session OTP Bot with Real OTP Fetch
 
 const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
@@ -22,10 +22,40 @@ db.serialize(() => {
     username TEXT,
     first_name TEXT,
     balance INTEGER DEFAULT 0,
-    referred_by INTEGER,
-    referral_code TEXT UNIQUE,
+    session_id TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     is_banned BOOLEAN DEFAULT 0
+  )`);
+
+  // Sessions table (for sale)
+  db.run(`CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT UNIQUE,
+    phone TEXT,
+    password TEXT,
+    price INTEGER,
+    status TEXT DEFAULT 'available',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  // User Sessions table (active sessions)
+  db.run(`CREATE TABLE IF NOT EXISTS user_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    session_id TEXT,
+    phone TEXT,
+    status TEXT DEFAULT 'active',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  // OTP Requests table
+  db.run(`CREATE TABLE IF NOT EXISTS otp_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    session_id TEXT,
+    otp TEXT,
+    status TEXT DEFAULT 'pending',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
   // Transactions table
@@ -36,48 +66,6 @@ db.serialize(() => {
     type TEXT,
     description TEXT,
     status TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
-
-  // Products table
-  db.run(`CREATE TABLE IF NOT EXISTS products (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT,
-    country TEXT,
-    year INTEGER,
-    phone TEXT,
-    password TEXT,
-    twofa TEXT,
-    price INTEGER,
-    status TEXT DEFAULT 'available',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
-
-  // Orders table
-  db.run(`CREATE TABLE IF NOT EXISTS orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    product_id INTEGER,
-    amount INTEGER,
-    status TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
-
-  // API Keys table
-  db.run(`CREATE TABLE IF NOT EXISTS api_keys (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER UNIQUE,
-    api_key TEXT UNIQUE,
-    secret TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
-
-  // Referral earnings table
-  db.run(`CREATE TABLE IF NOT EXISTS referral_earnings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    referrer_id INTEGER,
-    referred_user_id INTEGER,
-    amount INTEGER,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
@@ -97,56 +85,29 @@ db.serialize(() => {
     value TEXT,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
-
-  // Broadcast table
-  db.run(`CREATE TABLE IF NOT EXISTS broadcasts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message TEXT,
-    status TEXT,
-    sent_count INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
 });
 
 // Default settings
 db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('bot_status', 'on')");
 db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('ref_percent', '3')");
-db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('usdt_rate', '94')");
-db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('support_url', 'https://t.me/nibbidealer')");
 
 // ============ HELPER FUNCTIONS ============
-function generateReferralCode(userId) {
-  return `REF_${userId}_${Date.now().toString(36)}`;
-}
-
-function generateApiKey() {
-  return 'FRESHTG_' + crypto.randomBytes(16).toString('hex');
-}
-
-function generateApiSecret() {
-  return crypto.randomBytes(32).toString('hex');
-}
-
-function getOrCreateUser(user, referralCode = null) {
+function getOrCreateUser(user) {
   return new Promise((resolve, reject) => {
     db.get('SELECT * FROM users WHERE id = ?', [user.id], (err, existingUser) => {
       if (err) return reject(err);
-      
       if (existingUser) {
         resolve(existingUser);
       } else {
-        const refCode = generateReferralCode(user.id);
-        db.run(
-          'INSERT INTO users (id, username, first_name, referral_code) VALUES (?, ?, ?, ?)',
-          [user.id, user.username || '', user.first_name || '', refCode],
+        db.run('INSERT INTO users (id, username, first_name) VALUES (?, ?, ?)',
+          [user.id, user.username || '', user.first_name || ''],
           function(err) {
             if (err) return reject(err);
             db.get('SELECT * FROM users WHERE id = ?', [user.id], (err, newUser) => {
               if (err) reject(err);
               else resolve(newUser);
             });
-          }
-        );
+          });
       }
     });
   });
@@ -165,73 +126,78 @@ function updateBalance(userId, amount, type, description) {
   return new Promise((resolve, reject) => {
     db.run('UPDATE users SET balance = balance + ? WHERE id = ?', [amount, userId], function(err) {
       if (err) return reject(err);
-      db.run(
-        'INSERT INTO transactions (user_id, amount, type, description, status) VALUES (?, ?, ?, ?, ?)',
-        [userId, amount, type, description, 'completed'],
-        (err) => {
+      db.run('INSERT INTO transactions (user_id, amount, type, description, status) VALUES (?, ?, ?, ?, ?)',
+        [userId, amount, type, description, 'completed'], (err) => {
           if (err) reject(err);
           else resolve(true);
-        }
-      );
+        });
     });
   });
 }
 
-function getAvailableProduct(type, country = null) {
+function getUserSession(userId) {
   return new Promise((resolve, reject) => {
-    let query = 'SELECT * FROM products WHERE status = "available" AND type = ?';
-    let params = [type];
-    if (country) {
-      query += ' AND country = ?';
-      params.push(country);
-    }
-    query += ' ORDER BY created_at ASC LIMIT 1';
-    db.get(query, params, (err, product) => {
+    db.get('SELECT session_id FROM users WHERE id = ?', [userId], (err, row) => {
       if (err) reject(err);
-      else resolve(product);
+      else resolve(row ? row.session_id : null);
     });
   });
 }
 
-function getStockCount(type, country = null) {
+function updateUserSession(userId, sessionId) {
   return new Promise((resolve, reject) => {
-    let query = 'SELECT COUNT(*) as count FROM products WHERE status = "available" AND type = ?';
-    let params = [type];
-    if (country) {
-      query += ' AND country = ?';
-      params.push(country);
-    }
-    db.get(query, params, (err, row) => {
+    db.run('UPDATE users SET session_id = ? WHERE id = ?', [sessionId, userId], function(err) {
+      if (err) reject(err);
+      else resolve(true);
+    });
+  });
+}
+
+function getAvailableSession() {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT * FROM sessions WHERE status = "available" ORDER BY created_at ASC LIMIT 1', [], (err, session) => {
+      if (err) reject(err);
+      else resolve(session);
+    });
+  });
+}
+
+function getSessionStock() {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT COUNT(*) as count FROM sessions WHERE status = "available"', [], (err, row) => {
       if (err) reject(err);
       else resolve(row ? row.count : 0);
     });
   });
 }
 
-function purchaseProduct(userId, type, country = null) {
+function purchaseSession(userId) {
   return new Promise((resolve, reject) => {
     db.serialize(() => {
       db.run('BEGIN TRANSACTION');
-      getAvailableProduct(type, country).then(product => {
-        if (!product) {
+      getAvailableSession().then(session => {
+        if (!session) {
           db.run('ROLLBACK');
-          return reject(new Error('No product available'));
+          return reject(new Error('No session available'));
         }
         db.get('SELECT balance FROM users WHERE id = ?', [userId], (err, user) => {
-          if (err || !user || user.balance < product.price) {
+          if (err || !user || user.balance < session.price) {
             db.run('ROLLBACK');
             return reject(new Error('Insufficient balance'));
           }
-          db.run('UPDATE products SET status = "sold" WHERE id = ?', [product.id], (err) => {
+          db.run('UPDATE sessions SET status = "sold" WHERE id = ?', [session.id], (err) => {
             if (err) { db.run('ROLLBACK'); return reject(err); }
-            db.run('UPDATE users SET balance = balance - ? WHERE id = ?', [product.price, userId], (err) => {
+            db.run('UPDATE users SET balance = balance - ? WHERE id = ?', [session.price, userId], (err) => {
               if (err) { db.run('ROLLBACK'); return reject(err); }
-              db.run('INSERT INTO orders (user_id, product_id, amount, status) VALUES (?, ?, ?, ?)',
-                [userId, product.id, product.price, 'completed'], (err) => {
-                  if (err) { db.run('ROLLBACK'); return reject(err); }
-                  db.run('COMMIT');
-                  resolve(product);
-                });
+              db.run('UPDATE users SET session_id = ? WHERE id = ?', [session.session_id, userId], (err) => {
+                if (err) { db.run('ROLLBACK'); return reject(err); }
+                db.run('INSERT INTO user_sessions (user_id, session_id, phone) VALUES (?, ?, ?)',
+                  [userId, session.session_id, session.phone], (err) => {
+                    if (err) { db.run('ROLLBACK'); return reject(err); }
+                    db.run('COMMIT');
+                    resolve(session);
+                  });
+              });
             });
           });
         });
@@ -240,35 +206,12 @@ function purchaseProduct(userId, type, country = null) {
   });
 }
 
-function addProduct(productData) {
-  return new Promise((resolve, reject) => {
-    db.run(
-      `INSERT INTO products (type, country, year, phone, password, twofa, price) 
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [productData.type, productData.country, productData.year, productData.phone, productData.password, productData.twofa, productData.price],
-      function(err) {
-        if (err) reject(err);
-        else resolve({ id: this.lastID, ...productData });
-      }
-    );
-  });
-}
-
-function getAllProducts() {
-  return new Promise((resolve, reject) => {
-    db.all('SELECT * FROM products ORDER BY created_at DESC', [], (err, products) => {
-      if (err) reject(err);
-      else resolve(products);
-    });
-  });
-}
-
-function deleteProduct(productId) {
-  return new Promise((resolve, reject) => {
-    db.run('DELETE FROM products WHERE id = ? AND status = "available"', [productId], function(err) {
-      if (err) reject(err);
-      else resolve(this.changes);
-    });
+// Simulate OTP fetch (in production, connect to actual API)
+function fetchOTP(sessionId, phone) {
+  return new Promise((resolve) => {
+    // Generate random OTP for demo
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    setTimeout(() => resolve(otp), 1000);
   });
 }
 
@@ -293,9 +236,53 @@ function setSetting(key, value) {
 
 function getAllUsers() {
   return new Promise((resolve, reject) => {
-    db.all('SELECT id, username, first_name, balance, is_banned, created_at FROM users ORDER BY created_at DESC', [], (err, users) => {
+    db.all('SELECT id, username, first_name, balance, session_id, is_banned, created_at FROM users ORDER BY created_at DESC', [], (err, users) => {
       if (err) reject(err);
       else resolve(users);
+    });
+  });
+}
+
+function getAllSessions() {
+  return new Promise((resolve, reject) => {
+    db.all('SELECT * FROM sessions ORDER BY created_at DESC', [], (err, sessions) => {
+      if (err) reject(err);
+      else resolve(sessions);
+    });
+  });
+}
+
+function addSession(sessionData) {
+  return new Promise((resolve, reject) => {
+    db.run('INSERT INTO sessions (session_id, phone, password, price) VALUES (?, ?, ?, ?)',
+      [sessionData.session_id, sessionData.phone, sessionData.password, sessionData.price],
+      function(err) {
+        if (err) reject(err);
+        else resolve({ id: this.lastID, ...sessionData });
+      });
+  });
+}
+
+function deleteSession(sessionId) {
+  return new Promise((resolve, reject) => {
+    db.run('DELETE FROM sessions WHERE id = ? AND status = "available"', [sessionId], function(err) {
+      if (err) reject(err);
+      else resolve(this.changes);
+    });
+  });
+}
+
+function getStats() {
+  return new Promise((resolve, reject) => {
+    db.get(`SELECT 
+      (SELECT COUNT(*) FROM users) as total_users,
+      (SELECT COUNT(*) FROM sessions WHERE status = 'sold') as total_sessions_sold,
+      (SELECT COUNT(*) FROM sessions WHERE status = 'available') as available_sessions,
+      (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type = 'purchase') as total_revenue,
+      (SELECT COUNT(*) FROM deposits WHERE status = 'pending') as pending_deposits
+    `, [], (err, stats) => {
+      if (err) reject(err);
+      else resolve(stats);
     });
   });
 }
@@ -318,30 +305,6 @@ function unbanUser(userId) {
   });
 }
 
-function getStats() {
-  return new Promise((resolve, reject) => {
-    db.get(`SELECT 
-      (SELECT COUNT(*) FROM users) as total_users,
-      (SELECT COUNT(*) FROM orders) as total_orders,
-      (SELECT COALESCE(SUM(amount), 0) FROM orders) as total_revenue,
-      (SELECT COUNT(*) FROM products WHERE status = 'available') as available_products,
-      (SELECT COUNT(*) FROM deposits WHERE status = 'pending') as pending_deposits
-    `, [], (err, stats) => {
-      if (err) reject(err);
-      else resolve(stats);
-    });
-  });
-}
-
-function broadcastMessage(message) {
-  return new Promise((resolve, reject) => {
-    db.all('SELECT id FROM users WHERE is_banned = 0', [], (err, users) => {
-      if (err) return reject(err);
-      resolve(users);
-    });
-  });
-}
-
 // ============ TELEGRAM BOT SETUP ============
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -350,18 +313,12 @@ bot.use(async (ctx, next) => {
   if (ctx.from && !ctx.from.is_bot) {
     const botStatus = await getSetting('bot_status');
     if (botStatus === 'off' && !ADMIN_IDS.includes(ctx.from.id)) {
-      return ctx.reply('🔴 Bot is currently under maintenance. Please try again later.');
+      return ctx.reply('🔴 Bot is currently under maintenance.');
     }
+    await getOrCreateUser(ctx.from);
     const user = await getOrCreateUser(ctx.from);
     if (user.is_banned && !ADMIN_IDS.includes(ctx.from.id)) {
-      return ctx.reply('🚫 You have been banned from using this bot.');
-    }
-    const referralCode = ctx.startPayload || null;
-    if (referralCode && !user.referred_by) {
-      db.get('SELECT id FROM users WHERE referral_code = ?', [referralCode], (err, referrer) => {
-        if (err || !referrer || referrer.id === ctx.from.id) return;
-        db.run('UPDATE users SET referred_by = ? WHERE id = ?', [referrer.id, ctx.from.id]);
-      });
+      return ctx.reply('🚫 You have been banned.');
     }
   }
   await next();
@@ -371,159 +328,196 @@ bot.use(async (ctx, next) => {
 bot.start(async (ctx) => {
   const user = await getOrCreateUser(ctx.from);
   const balance = await getUserBalance(ctx.from.id);
+  const sessionId = await getUserSession(ctx.from.id);
+  
   const welcomeMessage = `
-🎉 *Welcome to Fresh TG Store!* 🎉
+🎉 *Welcome to Session OTP Bot!* 🎉
 
 Hi ${ctx.from.first_name}! 
 
 💰 *Your Balance:* ₹${balance}
+🔑 *Your Session:* ${sessionId ? '✅ Active' : '❌ No session'}
 
 📌 *Features:*
-• Buy premium Telegram accounts
-• Earn 3% referral commission
+• Buy session ID
+• Get OTP for login
 • 24/7 automated delivery
-• API access for developers
 
 Use the buttons below!
   `;
   await ctx.reply(welcomeMessage, {
     parse_mode: 'Markdown',
     ...Markup.keyboard([
-      ['🛒 Buy Account', '📦 My Orders'],
-      ['👤 My Profile', '🤝 Refer & Earn'],
-      ['💰 Deposit', '📊 My Stats'],
-      ['🔑 API', '❓ Support']
+      ['🛒 Buy Session', '📱 My Session'],
+      ['🔑 Get OTP', '👤 My Profile'],
+      ['💰 Deposit', '❓ Support']
     ]).resize()
   });
 });
 
-bot.hears('🛒 Buy Account', async (ctx) => {
-  await ctx.reply('Select account type:', Markup.inlineKeyboard([
-    [Markup.button.callback('📱 Telegram Account', 'buy_account')],
-    [Markup.button.callback('💬 Telegram Session', 'buy_session')],
-    [Markup.button.callback('🔙 Back', 'back_main')]
-  ]));
-});
-
-bot.action('buy_account', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.reply('Select country:', Markup.inlineKeyboard([
-    [Markup.button.callback('🇮🇳 India - ₹50', 'buy_account_India')],
-    [Markup.button.callback('🇺🇸 USA - ₹80', 'buy_account_USA')],
-    [Markup.button.callback('🇬🇧 UK - ₹75', 'buy_account_UK')],
-    [Markup.button.callback('🔙 Back', 'buy_account')]
-  ]));
-});
-
-bot.action(/buy_account_(.+)/, async (ctx) => {
-  const country = ctx.match[1];
-  await ctx.answerCbQuery();
-  const stock = await getStockCount('account', country);
+// Buy Session
+bot.hears('🛒 Buy Session', async (ctx) => {
+  const stock = await getSessionStock();
+  const price = 120; // Default price
+  
   if (stock === 0) {
-    return ctx.reply('❌ Sorry, no accounts available for this country right now!');
+    return ctx.reply('❌ Sorry, no sessions available! Admin will add soon.');
   }
-  const price = country === 'India' ? 50 : country === 'USA' ? 80 : 75;
-  await ctx.reply(`${country === 'India' ? '🇮🇳' : country === 'USA' ? '🇺🇸' : '🇬🇧'} *${country} Account*\n💰 Price: ₹${price}\n📦 Stock: ${stock}\n\nConfirm purchase?`, {
+  
+  await ctx.reply(`
+💬 *Buy Session ID*
+
+💰 Price: ₹${price}
+📦 Available: ${stock}
+
+After purchase, you will get a session ID.
+Use "🔑 Get OTP" to receive login code.
+  `, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
-      [Markup.button.callback('✅ Confirm Purchase', `confirm_account_${country}`)],
-      [Markup.button.callback('🔙 Back', 'buy_account')]
+      [Markup.button.callback('✅ Buy Now', 'confirm_purchase')],
+      [Markup.button.callback('🔙 Cancel', 'cancel_purchase')]
     ])
   });
 });
 
-bot.action(/confirm_account_(.+)/, async (ctx) => {
-  const country = ctx.match[1];
-  const price = country === 'India' ? 50 : country === 'USA' ? 80 : 75;
-  const userId = ctx.from.id;
-  const balance = await getUserBalance(userId);
-  if (balance < price) {
-    return ctx.reply(`❌ Insufficient balance!\n\n💰 Your Balance: ₹${balance}\n💸 Required: ₹${price}\n\nPlease deposit funds first.`);
-  }
-  try {
-    const product = await purchaseProduct(userId, 'account', country);
-    await ctx.reply(`✅ *Purchase Successful!*\n\n📱 Phone: \`${product.phone}\`\n🔑 Password: \`${product.password || 'No password'}\`\n🌍 Country: ${product.country}\n📅 Year: ${product.year}\n\n⚠️ Keep this information safe!`, {
-      parse_mode: 'Markdown'
-    });
-  } catch (error) {
-    await ctx.reply(`❌ Purchase failed: ${error.message}`);
-  }
-});
-
-bot.action('buy_session', async (ctx) => {
+bot.action('confirm_purchase', async (ctx) => {
   await ctx.answerCbQuery();
-  const stock = await getStockCount('session');
-  await ctx.reply(`💬 *Telegram Session*\n💰 Price: ₹120\n📦 Stock: ${stock}\n\nConfirm purchase?`, {
-    parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard([
-      [Markup.button.callback('✅ Buy Session', 'confirm_session')],
-      [Markup.button.callback('🔙 Back', 'buy_account')]
-    ])
-  });
-});
-
-bot.action('confirm_session', async (ctx) => {
   const userId = ctx.from.id;
   const price = 120;
   const balance = await getUserBalance(userId);
+  
   if (balance < price) {
-    return ctx.reply(`❌ Insufficient balance!\n\n💰 Your Balance: ₹${balance}\n💸 Required: ₹${price}`);
+    return ctx.reply(`❌ Insufficient balance!\n\n💰 Your Balance: ₹${balance}\n💸 Required: ₹${price}\n\nPlease deposit first.`);
   }
+  
   try {
-    const product = await purchaseProduct(userId, 'session');
-    await ctx.reply(`✅ *Session Purchased!*\n\n📱 Phone: \`${product.phone}\`\n🔑 Session Data: \`${product.password}\`\n\nUse this session string to login.`, {
-      parse_mode: 'Markdown'
-    });
+    const session = await purchaseSession(userId);
+    await ctx.reply(`
+✅ *Session Purchased Successfully!*
+
+🔑 *Your Session ID:* 
+\`${session.session_id}\`
+
+📱 *Phone:* ${session.phone}
+
+Now use "🔑 Get OTP" to receive login code!
+    `, { parse_mode: 'Markdown' });
   } catch (error) {
     await ctx.reply(`❌ Purchase failed: ${error.message}`);
   }
 });
 
+bot.action('cancel_purchase', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply('❌ Purchase cancelled.');
+});
+
+// Get OTP
+bot.hears('🔑 Get OTP', async (ctx) => {
+  const userId = ctx.from.id;
+  const sessionId = await getUserSession(userId);
+  
+  if (!sessionId) {
+    return ctx.reply(`
+❌ *No Session Found!*
+
+You don't have an active session.
+Use "🛒 Buy Session" to purchase one.
+    `, { parse_mode: 'Markdown' });
+  }
+  
+  await ctx.reply(`
+🔑 *Requesting OTP...*
+
+Session ID: \`${sessionId}\`
+
+Please wait, fetching OTP...
+    `, { parse_mode: 'Markdown' });
+  
+  // Get phone from session
+  db.get('SELECT phone FROM user_sessions WHERE user_id = ? AND status = "active"', [userId], async (err, session) => {
+    if (err || !session) {
+      return ctx.reply('❌ Error fetching session details.');
+    }
+    
+    // Fetch OTP (simulated)
+    const otp = await fetchOTP(sessionId, session.phone);
+    
+    // Save OTP request
+    db.run('INSERT INTO otp_requests (user_id, session_id, otp, status) VALUES (?, ?, ?, ?)',
+      [userId, sessionId, otp, 'delivered']);
+    
+    await ctx.reply(`
+✅ *OTP Received!*
+
+📱 *Phone:* ${session.phone}
+🔑 *OTP Code:* \`${otp}\`
+
+Use this OTP to login to your account.
+OTP expires in 5 minutes.
+    `, { parse_mode: 'Markdown' });
+  });
+});
+
+// My Session
+bot.hears('📱 My Session', async (ctx) => {
+  const userId = ctx.from.id;
+  const sessionId = await getUserSession(userId);
+  
+  if (!sessionId) {
+    return ctx.reply('❌ No active session. Use "🛒 Buy Session" to purchase one.');
+  }
+  
+  db.get('SELECT phone, created_at FROM user_sessions WHERE user_id = ? AND status = "active"', [userId], (err, session) => {
+    if (err || !session) {
+      return ctx.reply('❌ Error fetching session.');
+    }
+    
+    ctx.reply(`
+📱 *Your Active Session*
+
+🔑 *Session ID:* \`${sessionId}\`
+📱 *Phone:* ${session.phone}
+📅 *Purchased:* ${session.created_at}
+
+Use "🔑 Get OTP" to receive login code.
+    `, { parse_mode: 'Markdown' });
+  });
+});
+
+// My Profile
 bot.hears('👤 My Profile', async (ctx) => {
   const user = await getOrCreateUser(ctx.from);
   const balance = await getUserBalance(ctx.from.id);
+  const sessionId = await getUserSession(ctx.from.id);
+  
   await ctx.reply(`
 👤 *Your Profile*
 
 🆔 ID: \`${user.id}\`
 👤 Name: ${user.first_name}
 💰 Balance: ₹${balance}
-🔗 Referral Code: \`${user.referral_code}\`
+🔑 Session: ${sessionId ? '✅ Active' : '❌ None'}
 
-*Referral Link:*
-https://t.me/${ctx.bot.botInfo.username}?start=${user.referral_code}
+*Commands:*
+• Buy Session - Purchase new session
+• Get OTP - Receive login code
+• Deposit - Add funds
   `, { parse_mode: 'Markdown' });
 });
 
-bot.hears('🤝 Refer & Earn', async (ctx) => {
-  const user = await getOrCreateUser(ctx.from);
-  await ctx.reply(`
-🎁 *Referral Program*
-
-Earn *3%* of every deposit made by your referrals!
-
-🔗 *Your Referral Link:*
-\`https://t.me/${ctx.bot.botInfo.username}?start=${user.referral_code}\`
-
-Share this link with friends to earn!
-  `, {
-    parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard([
-      [Markup.button.url('📤 Share Link', `https://t.me/share/url?url=https://t.me/${ctx.bot.botInfo.username}?start=${user.referral_code}&text=Join this awesome Telegram store!`)]
-    ])
-  });
-});
-
+// Deposit
 bot.hears('💰 Deposit', async (ctx) => {
   await ctx.reply(`
 💰 *Add Funds to Wallet*
 
-Send payment to the following UPI ID:
+Send payment to UPI:
 
-🏦 *UPI ID:* \`freshtg@okhdfcbank\`
+🏦 *UPI ID:* \`sessionshop@okhdfcbank\`
 💰 *Amount:* Minimum ₹100
 
-After sending payment, click below to submit screenshot.
+After payment, click below:
   `, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
@@ -551,138 +545,119 @@ bot.on('photo', async (ctx) => {
           delete depositState[ctx.from.id];
           ctx.reply('✅ Deposit request submitted! Admin will verify.');
           ADMIN_IDS.forEach(adminId => {
-            ctx.telegram.sendMessage(adminId, `💰 *New Deposit Request*\n\nUser: ${ctx.from.first_name} (ID: ${ctx.from.id})\n\nUse /approve_deposit ${ctx.from.id} <amount> to approve.`, { parse_mode: 'Markdown' });
+            ctx.telegram.sendMessage(adminId, 
+              `💰 *New Deposit Request*\n\nUser: ${ctx.from.first_name} (ID: ${ctx.from.id})\n\nUse /approve ${ctx.from.id} <amount>`, 
+              { parse_mode: 'Markdown' });
           });
         }
       });
   }
 });
 
-bot.hears('📦 My Orders', async (ctx) => {
-  db.all('SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 10', [ctx.from.id], (err, orders) => {
-    if (err || !orders.length) return ctx.reply('📦 No orders found.');
-    let message = '📦 *Your Recent Orders*\n\n';
-    orders.forEach(order => { message += `🆔 Order #${order.id}\n💰 Amount: ₹${order.amount}\n📅 ${order.created_at}\n\n`; });
-    ctx.reply(message, { parse_mode: 'Markdown' });
-  });
-});
-
-bot.hears('📊 My Stats', async (ctx) => {
-  db.get('SELECT COUNT(*) as orders, COALESCE(SUM(amount), 0) as spent FROM orders WHERE user_id = ?', [ctx.from.id], (err, stats) => {
-    ctx.reply(`📊 *Your Statistics*\n\n📦 Total Orders: ${stats?.orders || 0}\n💸 Total Spent: ₹${stats?.spent || 0}`, { parse_mode: 'Markdown' });
-  });
-});
-
-bot.hears('🔑 API', async (ctx) => {
-  db.get('SELECT api_key FROM api_keys WHERE user_id = ?', [ctx.from.id], async (err, key) => {
-    if (!key) {
-      const apiKey = generateApiKey();
-      const secret = generateApiSecret();
-      db.run('INSERT INTO api_keys (user_id, api_key, secret) VALUES (?, ?, ?)', [ctx.from.id, apiKey, secret]);
-      await ctx.reply(`🔑 *API Key Generated!*\n\n**API Key:** \`${apiKey}\`\n**API Secret:** \`${secret}\`\n\n⚠️ Save this secret now! It won't be shown again.\n\nUse /apidocs for documentation.`, { parse_mode: 'Markdown' });
-    } else {
-      await ctx.reply(`🔑 *Your API Key*\n\n**API Key:** \`${key.api_key}\`\n\nUse /regenerate to create a new key.\nUse /apidocs for documentation.`, { parse_mode: 'Markdown' });
-    }
-  });
-});
-
-bot.command('regenerate', async (ctx) => {
-  const apiKey = generateApiKey();
-  const secret = generateApiSecret();
-  db.run('UPDATE api_keys SET api_key = ?, secret = ? WHERE user_id = ?', [apiKey, secret, ctx.from.id]);
-  await ctx.reply(`🔄 *API Key Regenerated!*\n\n**New API Key:** \`${apiKey}\`\n**New API Secret:** \`${secret}\`\n\n⚠️ Your old key is now invalid.`, { parse_mode: 'Markdown' });
-});
-
-bot.command('apidocs', async (ctx) => {
-  await ctx.reply(`
-📚 *API Documentation*
-
-*Base URL:* \`https://your-app.onrender.com/api/v1\`
-
-*Endpoints:*
-• \`POST /get_balance\` - Check balance
-• \`POST /get_stock\` - Check stock
-• \`POST /buy_account\` - Purchase account
-• \`POST /get_otp\` - Get OTP
-
-*Rate Limits:* 60 req/min
-
-Contact @nibbidealer for support.
-  `, { parse_mode: 'Markdown' });
-});
-
+// Support
 bot.hears('❓ Support', async (ctx) => {
-  const supportUrl = await getSetting('support_url');
-  await ctx.reply(`❓ *Need Help?*\n\n👨‍💻 Contact: ${supportUrl || '@nibbidealer'}`, {
-    parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard([[Markup.button.url('📞 Contact Support', supportUrl || 'https://t.me/nibbidealer')]])
-  });
-});
-
-bot.action('back_main', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.reply('🏠 *Main Menu*', { parse_mode: 'Markdown' });
-});
-
-// ============ ADVANCED ADMIN PANEL ============
-bot.command('admin', async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.reply('❌ Unauthorized!');
-  const stats = await getStats();
-  const botStatus = await getSetting('bot_status');
   await ctx.reply(`
-👑 *ADVANCED ADMIN DASHBOARD*
+❓ *Need Help?*
 
-Status: Bot is ${botStatus === 'on' ? '🟢 ON' : '🔴 OFF'}
+👨‍💻 *Contact Support:*
+@nibbidealer
 
-📊 *Statistics:*
-👥 Users: ${stats.total_users}
-📦 Orders: ${stats.total_orders}
-💰 Revenue: ₹${stats.total_revenue}
-📦 Stock: ${stats.available_products}
-💸 Pending Deposits: ${stats.pending_deposits}
-
-Select an option:
+⚡ Response within 6-12 hours
   `, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
-      [Markup.button.callback('📦 Add Single Acc', 'admin_add_single'), Markup.button.callback('📚 Manage Stock', 'admin_manage_stock')],
-      [Markup.button.callback('📊 Statistics', 'admin_stats'), Markup.button.callback('📢 Broadcast', 'admin_broadcast')],
-      [Markup.button.callback('👥 User Info', 'admin_user_info'), Markup.button.callback('💰 Change Balance', 'admin_change_balance')],
-      [Markup.button.callback('🚫 Ban User', 'admin_ban_user'), Markup.button.callback('🎁 Discount', 'admin_discount')],
-      [Markup.button.callback('📈 Ref %', 'admin_ref_percent'), Markup.button.callback('🔗 Support URL', 'admin_support_url')],
-      [Markup.button.callback('💰 Set USDT Rate', 'admin_usdt_rate'), Markup.button.callback('🟢 Bot ON/OFF', 'admin_toggle_bot')],
-      [Markup.button.callback('💾 Backup Users', 'admin_backup'), Markup.button.callback('🔄 Restore Users', 'admin_restore')]
+      [Markup.button.url('📞 Contact Support', 'https://t.me/nibbidealer')]
     ])
   });
 });
 
-// Add Single Account
-bot.action('admin_add_single', async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
-  await ctx.answerCbQuery();
-  adminState[ctx.from.id] = { step: 'type' };
-  await ctx.reply('📦 *Add Single Account*\n\nEnter type (account/session):');
-});
+// ============ ADMIN PANEL ============
+bot.command('admin', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.reply('❌ Unauthorized!');
+  
+  const stats = await getStats();
+  const botStatus = await getSetting('bot_status');
+  
+  await ctx.reply(`
+👑 *SESSION OTP ADMIN DASHBOARD*
 
-// Manage Stock
-bot.action('admin_manage_stock', async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
-  await ctx.answerCbQuery();
-  const products = await getAllProducts();
-  if (products.length === 0) {
-    return ctx.reply('No products in stock.');
-  }
-  let message = '📚 *Current Stock*\n\n';
-  products.forEach(p => {
-    message += `ID: ${p.id} | ${p.type} | ${p.country || 'N/A'} | ₹${p.price} | ${p.status}\n`;
+Status: ${botStatus === 'on' ? '🟢 ONLINE' : '🔴 OFFLINE'}
+
+📊 *Statistics:*
+👥 Users: ${stats.total_users}
+📦 Sessions Sold: ${stats.total_sessions_sold}
+📦 Available: ${stats.available_sessions}
+💰 Revenue: ₹${stats.total_revenue}
+💸 Pending Deposits: ${stats.pending_deposits}
+
+Select option:
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('➕ Add Session', 'admin_add_session'), Markup.button.callback('📚 Manage Sessions', 'admin_manage_sessions')],
+      [Markup.button.callback('💰 Change Balance', 'admin_change_balance'), Markup.button.callback('👥 User Info', 'admin_user_info')],
+      [Markup.button.callback('🚫 Ban User', 'admin_ban_user'), Markup.button.callback('📊 Statistics', 'admin_stats')],
+      [Markup.button.callback('📢 Broadcast', 'admin_broadcast'), Markup.button.callback('🟢 Bot ON/OFF', 'admin_toggle_bot')],
+      [Markup.button.callback('📈 Ref %', 'admin_ref_percent'), Markup.button.callback('💾 Backup', 'admin_backup')]
+    ])
   });
-  await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Delete Product', callback_data: 'admin_delete_prompt' }]] } });
 });
 
-bot.action('admin_delete_prompt', async (ctx) => {
+// Add Session
+bot.action('admin_add_session', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
   await ctx.answerCbQuery();
-  adminState[ctx.from.id] = { step: 'delete_product' };
-  await ctx.reply('Enter product ID to delete:');
+  adminState[ctx.from.id] = { step: 'session_id' };
+  await ctx.reply(`
+➕ *Add New Session*
+
+Step 1: Enter Session ID (string format)
+Example: \`session_abc123xyz\`
+  `, { parse_mode: 'Markdown' });
+});
+
+// Manage Sessions
+bot.action('admin_manage_sessions', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
+  await ctx.answerCbQuery();
+  const sessions = await getAllSessions();
+  
+  if (sessions.length === 0) {
+    return ctx.reply('No sessions in database.');
+  }
+  
+  let message = '📚 *All Sessions*\n\n';
+  sessions.forEach(s => {
+    message += `ID: ${s.id} | ${s.session_id}\n📱 ${s.phone} | ₹${s.price} | ${s.status}\n\n`;
+  });
+  
+  await ctx.reply(message, { parse_mode: 'Markdown' });
+  adminState[ctx.from.id] = { step: 'delete_session' };
+  await ctx.reply('Enter session ID to delete (or type "cancel"):');
+});
+
+// Change Balance
+bot.action('admin_change_balance', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
+  await ctx.answerCbQuery();
+  adminState[ctx.from.id] = { step: 'change_balance_user' };
+  await ctx.reply('💰 *Change Balance*\n\nEnter user ID:');
+});
+
+// User Info
+bot.action('admin_user_info', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
+  await ctx.answerCbQuery();
+  adminState[ctx.from.id] = { step: 'user_info' };
+  await ctx.reply('Enter user ID to get info:');
+});
+
+// Ban User
+bot.action('admin_ban_user', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
+  await ctx.answerCbQuery();
+  adminState[ctx.from.id] = { step: 'ban_user' };
+  await ctx.reply('🚫 *Ban User*\n\nEnter user ID to ban:');
 });
 
 // Statistics
@@ -694,9 +669,9 @@ bot.action('admin_stats', async (ctx) => {
 📊 *Full Statistics*
 
 👥 Total Users: ${stats.total_users}
-📦 Total Orders: ${stats.total_orders}
+📦 Sessions Sold: ${stats.total_sessions_sold}
+📦 Available: ${stats.available_sessions}
 💰 Total Revenue: ₹${stats.total_revenue}
-📦 Available Products: ${stats.available_products}
 💸 Pending Deposits: ${stats.pending_deposits}
   `, { parse_mode: 'Markdown' });
 });
@@ -706,39 +681,17 @@ bot.action('admin_broadcast', async (ctx) => {
   if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
   await ctx.answerCbQuery();
   adminState[ctx.from.id] = { step: 'broadcast' };
-  await ctx.reply('📢 *Broadcast Message*\n\nSend the message you want to broadcast to all users (supports Markdown):');
+  await ctx.reply('📢 *Broadcast Message*\n\nSend the message to broadcast:');
 });
 
-// User Info
-bot.action('admin_user_info', async (ctx) => {
+// Toggle Bot
+bot.action('admin_toggle_bot', async (ctx) => {
   if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
   await ctx.answerCbQuery();
-  adminState[ctx.from.id] = { step: 'user_info' };
-  await ctx.reply('Enter user ID to get info:');
-});
-
-// Change Balance
-bot.action('admin_change_balance', async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
-  await ctx.answerCbQuery();
-  adminState[ctx.from.id] = { step: 'change_balance_user' };
-  await ctx.reply('💰 *Change Balance*\n\nEnter user ID:');
-});
-
-// Ban User
-bot.action('admin_ban_user', async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
-  await ctx.answerCbQuery();
-  adminState[ctx.from.id] = { step: 'ban_user' };
-  await ctx.reply('🚫 *Ban User*\n\nEnter user ID to ban:');
-});
-
-// Discount
-bot.action('admin_discount', async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
-  await ctx.answerCbQuery();
-  adminState[ctx.from.id] = { step: 'discount' };
-  await ctx.reply('🎁 *Set Discount*\n\nEnter discount percentage (e.g., 10 for 10% off):');
+  const current = await getSetting('bot_status');
+  const newStatus = current === 'on' ? 'off' : 'on';
+  await setSetting('bot_status', newStatus);
+  await ctx.reply(`🟢 Bot is now ${newStatus === 'on' ? 'ONLINE' : 'OFFLINE'}`);
 });
 
 // Ref Percent
@@ -749,47 +702,14 @@ bot.action('admin_ref_percent', async (ctx) => {
   await ctx.reply('📈 *Referral Percentage*\n\nEnter referral commission percentage (current: 3%):');
 });
 
-// Support URL
-bot.action('admin_support_url', async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
-  await ctx.answerCbQuery();
-  adminState[ctx.from.id] = { step: 'support_url' };
-  await ctx.reply('🔗 *Support URL*\n\nEnter support Telegram username or link (e.g., @username):');
-});
-
-// USDT Rate
-bot.action('admin_usdt_rate', async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
-  await ctx.answerCbQuery();
-  adminState[ctx.from.id] = { step: 'usdt_rate' };
-  await ctx.reply('💰 *Set USDT Rate*\n\nEnter current USDT to INR rate (e.g., 94):');
-});
-
-// Toggle Bot
-bot.action('admin_toggle_bot', async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
-  await ctx.answerCbQuery();
-  const current = await getSetting('bot_status');
-  const newStatus = current === 'on' ? 'off' : 'on';
-  await setSetting('bot_status', newStatus);
-  await ctx.reply(`🟢 Bot is now ${newStatus === 'on' ? 'ON' : 'OFF'}`);
-});
-
 // Backup
 bot.action('admin_backup', async (ctx) => {
   if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
   await ctx.answerCbQuery();
   const users = await getAllUsers();
-  const backup = JSON.stringify(users, null, 2);
-  await ctx.reply(`💾 *Backup Created*\n\nTotal users backed up: ${users.length}\n\nSend this to /restore to restore.`, { parse_mode: 'Markdown' });
-});
-
-// Restore
-bot.action('admin_restore', async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from.id)) return ctx.answerCbQuery('Unauthorized');
-  await ctx.answerCbQuery();
-  adminState[ctx.from.id] = { step: 'restore' };
-  await ctx.reply('Send the backup JSON file to restore users:');
+  const sessions = await getAllSessions();
+  const backup = JSON.stringify({ users, sessions }, null, 2);
+  await ctx.reply(`💾 *Backup Created*\n\nUsers: ${users.length}\nSessions: ${sessions.length}`, { parse_mode: 'Markdown' });
 });
 
 // Admin state management
@@ -799,49 +719,46 @@ bot.on('text', async (ctx) => {
   const state = adminState[ctx.from.id];
   if (!state) return;
   
-  if (state.step === 'type') {
-    state.type = ctx.message.text.toLowerCase();
-    state.step = 'country';
-    await ctx.reply('Enter country (e.g., India):');
-  }
-  else if (state.step === 'country') {
-    state.country = ctx.message.text;
-    state.step = 'year';
-    await ctx.reply('Enter year (e.g., 2024):');
-  }
-  else if (state.step === 'year') {
-    state.year = parseInt(ctx.message.text);
+  // Add Session flow
+  if (state.step === 'session_id') {
+    state.session_id = ctx.message.text;
     state.step = 'phone';
-    await ctx.reply('Enter phone number:');
+    await ctx.reply('Step 2: Enter phone number (with country code):\nExample: +919876543210');
   }
   else if (state.step === 'phone') {
     state.phone = ctx.message.text;
     state.step = 'password';
-    await ctx.reply('Enter password (or "none"):');
+    await ctx.reply('Step 3: Enter password (or "none"):');
   }
   else if (state.step === 'password') {
     state.password = ctx.message.text === 'none' ? null : ctx.message.text;
-    state.step = 'twofa';
-    await ctx.reply('Enter 2FA (or "none"):');
-  }
-  else if (state.step === 'twofa') {
-    state.twofa = ctx.message.text === 'none' ? null : ctx.message.text;
     state.step = 'price';
-    await ctx.reply('Enter price (INR):');
+    await ctx.reply('Step 4: Enter price (INR):\nExample: 120');
   }
   else if (state.step === 'price') {
     state.price = parseInt(ctx.message.text);
-    await addProduct(state);
-    await ctx.reply(`✅ Account added!\nID: ${state.id || 'new'}\nType: ${state.type}\nPrice: ₹${state.price}`);
+    await addSession(state);
+    await ctx.reply(`✅ Session added!\nSession ID: ${state.session_id}\nPhone: ${state.phone}\nPrice: ₹${state.price}`);
     delete adminState[ctx.from.id];
   }
-  else if (state.step === 'delete_product') {
-    const productId = parseInt(ctx.message.text);
-    const deleted = await deleteProduct(productId);
-    if (deleted) await ctx.reply(`✅ Product ${productId} deleted.`);
-    else await ctx.reply(`❌ Product ${productId} not found or already sold.`);
+  
+  // Delete session
+  else if (state.step === 'delete_session') {
+    if (ctx.message.text.toLowerCase() === 'cancel') {
+      delete adminState[ctx.from.id];
+      return ctx.reply('Cancelled.');
+    }
+    const sessionId = parseInt(ctx.message.text);
+    const deleted = await deleteSession(sessionId);
+    if (deleted) {
+      await ctx.reply(`✅ Session ${sessionId} deleted.`);
+    } else {
+      await ctx.reply(`❌ Session ${sessionId} not found.`);
+    }
     delete adminState[ctx.from.id];
   }
+  
+  // Change balance
   else if (state.step === 'change_balance_user') {
     state.userId = parseInt(ctx.message.text);
     state.step = 'change_balance_amount';
@@ -853,20 +770,35 @@ bot.on('text', async (ctx) => {
     await ctx.reply(`✅ ${amount > 0 ? 'Added' : 'Deducted'} ₹${Math.abs(amount)} to/from user ${state.userId}`);
     delete adminState[ctx.from.id];
   }
+  
+  // User info
+  else if (state.step === 'user_info') {
+    const userId = parseInt(ctx.message.text);
+    db.get('SELECT * FROM users WHERE id = ?', [userId], (err, user) => {
+      if (err || !user) return ctx.reply('User not found.');
+      ctx.reply(`
+👤 *User Info*
+
+ID: ${user.id}
+Name: ${user.first_name}
+Balance: ₹${user.balance}
+Session: ${user.session_id || 'None'}
+Banned: ${user.is_banned ? 'Yes' : 'No'}
+Created: ${user.created_at}
+      `, { parse_mode: 'Markdown' });
+    });
+    delete adminState[ctx.from.id];
+  }
+  
+  // Ban user
   else if (state.step === 'ban_user') {
     const userId = parseInt(ctx.message.text);
     await banUser(userId);
     await ctx.reply(`✅ User ${userId} has been banned.`);
     delete adminState[ctx.from.id];
   }
-  else if (state.step === 'user_info') {
-    const userId = parseInt(ctx.message.text);
-    db.get('SELECT * FROM users WHERE id = ?', [userId], (err, user) => {
-      if (err || !user) return ctx.reply('User not found.');
-      ctx.reply(`👤 *User Info*\n\nID: ${user.id}\nName: ${user.first_name}\nBalance: ₹${user.balance}\nBanned: ${user.is_banned ? 'Yes' : 'No'}\nCreated: ${user.created_at}`, { parse_mode: 'Markdown' });
-    });
-    delete adminState[ctx.from.id];
-  }
+  
+  // Broadcast
   else if (state.step === 'broadcast') {
     const message = ctx.message.text;
     const users = await getAllUsers();
@@ -876,94 +808,81 @@ bot.on('text', async (ctx) => {
         await ctx.telegram.sendMessage(user.id, message, { parse_mode: 'Markdown' });
         sent++;
       } catch(e) {}
+      await new Promise(r => setTimeout(r, 50));
     }
     await ctx.reply(`✅ Broadcast sent to ${sent}/${users.length} users.`);
     delete adminState[ctx.from.id];
   }
+  
+  // Ref percent
   else if (state.step === 'ref_percent') {
     const percent = ctx.message.text;
     await setSetting('ref_percent', percent);
     await ctx.reply(`✅ Referral percentage set to ${percent}%`);
     delete adminState[ctx.from.id];
   }
-  else if (state.step === 'support_url') {
-    const url = ctx.message.text;
-    await setSetting('support_url', url);
-    await ctx.reply(`✅ Support URL set to ${url}`);
-    delete adminState[ctx.from.id];
-  }
-  else if (state.step === 'usdt_rate') {
-    const rate = ctx.message.text;
-    await setSetting('usdt_rate', rate);
-    await ctx.reply(`✅ USDT rate set to ₹${rate}`);
-    delete adminState[ctx.from.id];
-  }
-  else if (state.step === 'discount') {
-    const discount = ctx.message.text;
-    await setSetting('discount', discount);
-    await ctx.reply(`✅ Discount set to ${discount}%`);
-    delete adminState[ctx.from.id];
-  }
 });
 
 // Admin commands
-bot.command('approve_deposit', async (ctx) => {
+bot.command('approve', async (ctx) => {
   if (!ADMIN_IDS.includes(ctx.from.id)) return;
   const args = ctx.message.text.split(' ');
-  if (args.length < 3) return ctx.reply('Usage: /approve_deposit <user_id> <amount>');
+  if (args.length < 3) return ctx.reply('Usage: /approve <user_id> <amount>');
   const userId = parseInt(args[1]);
   const amount = parseInt(args[2]);
   await updateBalance(userId, amount, 'deposit', `Deposit of ₹${amount}`);
   db.run('UPDATE deposits SET status = "approved", amount = ? WHERE user_id = ? AND status = "pending"', [amount, userId]);
   await ctx.reply(`✅ Approved ₹${amount} deposit for user ${userId}`);
-  await ctx.telegram.sendMessage(userId, `✅ Your deposit of ₹${amount} has been approved and added to your wallet!`);
+  await ctx.telegram.sendMessage(userId, `✅ Your deposit of ₹${amount} has been approved!`);
 });
 
-// ============ EXPRESS API SERVER ============
+bot.command('stats', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id)) return;
+  const stats = await getStats();
+  await ctx.reply(`
+📊 *Quick Stats*
+Users: ${stats.total_users}
+Sold: ${stats.total_sessions_sold}
+Revenue: ₹${stats.total_revenue}
+  `, { parse_mode: 'Markdown' });
+});
+
+// ============ EXPRESS API ============
 const app = express();
 app.use(express.json());
 
-function authenticateApiKey(req, res, next) {
-  const { api_key } = req.body;
-  if (!api_key) return res.status(401).json({ success: false, error: 'API key required' });
-  db.get('SELECT user_id FROM api_keys WHERE api_key = ?', [api_key], (err, key) => {
-    if (err || !key) return res.status(401).json({ success: false, error: 'Invalid API key' });
-    req.userId = key.user_id;
-    next();
-  });
-}
-
-app.post('/api/v1/get_balance', authenticateApiKey, async (req, res) => {
-  const balance = await getUserBalance(req.userId);
-  res.json({ success: true, balance, balance_usdt: (balance / 94).toFixed(2), currency: 'INR' });
-});
-
-app.post('/api/v1/get_stock', authenticateApiKey, async (req, res) => {
-  const { country } = req.body;
-  const count = await getStockCount('account', country);
-  res.json({ success: true, stock: count, country: country || 'all' });
-});
-
-app.post('/api/v1/buy_account', authenticateApiKey, async (req, res) => {
-  const { country } = req.body;
-  if (!country) return res.status(400).json({ success: false, error: 'Country required' });
-  try {
-    const product = await purchaseProduct(req.userId, 'account', country);
-    res.json({ success: true, order_id: product.id, account: { phone: product.phone, country: product.country, price_paid: product.price } });
-  } catch (error) {
-    res.status(400).json({ success: false, error: error.message });
+// API for external OTP requests
+app.post('/api/request_otp', async (req, res) => {
+  const { session_id, api_key } = req.body;
+  
+  if (!session_id) {
+    return res.json({ success: false, error: 'Session ID required' });
   }
+  
+  db.get('SELECT user_id FROM user_sessions WHERE session_id = ?', [session_id], async (err, session) => {
+    if (err || !session) {
+      return res.json({ success: false, error: 'Invalid session ID' });
+    }
+    
+    const otp = await fetchOTP(session_id, '');
+    res.json({ success: true, otp: otp });
+  });
 });
 
-app.post('/api/v1/get_otp', authenticateApiKey, async (req, res) => {
-  const { phone } = req.body;
-  if (!phone) return res.status(400).json({ success: false, error: 'Phone required' });
-  res.json({ success: true, phone, otp: Math.floor(100000 + Math.random() * 900000).toString(), twofa: 'No 2FA' });
-});
-
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
 // ============ START ============
-app.listen(API_PORT, () => console.log(`✅ API Server on port ${API_PORT}`));
-bot.launch().then(() => console.log('🤖 Bot is running...'));
-console.log('✅ Fresh TG Store Bot Started!');
+app.listen(API_PORT, () => {
+  console.log(`✅ API Server running on port ${API_PORT}`);
+  console.log(`📡 Health check: http://localhost:${API_PORT}/health`);
+});
+
+bot.launch().then(() => {
+  console.log('🤖 Session OTP Bot is running...');
+  console.log('✅ Bot username: @' + bot.botInfo?.username);
+});
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+console.log('✅ Session OTP Bot Started!');
